@@ -89,7 +89,7 @@ class MPNN(pl.LightningModule):
         self.bn = nn.BatchNorm1d(self.message_passing.output_dim) if batch_norm else nn.Identity()
         self.predictor = predictor
 
-        # Initialize the LLaMA text encoder
+        # Initialize the text encoder
         self.tokenizer = AutoTokenizer.from_pretrained(text_encoder_model_name, trust_remote_code=True)
         self.text_encoder = LlamaModel.from_pretrained(text_encoder_model_name, trust_remote_code=True)
 

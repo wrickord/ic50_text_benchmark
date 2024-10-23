@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 from lightning import pytorch as pl
 import torch
+from torch.utils.data import DataLoader
 from chemprop import data, featurizers, nn
 
 # Local imports
@@ -17,6 +18,19 @@ from chemprop_custom.data import build_dataloader
 # CUDA
 print(f"CUDA available: {torch.cuda.is_available()}")
 
+
+class IC50_Dataset(torch.utils.data.Dataset):
+    def __init__(self, feature1, feature2, labels):
+        self.feature1 = feature1
+        self.feature2 = feature2
+        self.labels = labels
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        return (self.feature1[idx], self.feature2[idx]), self.labels[idx]
+    
 
 class IC50_Model():
     def __init__(self, 
@@ -174,19 +188,41 @@ class IC50_Model():
 
         mols_test_dset = data.MoleculeDataset(test_mols, featurizer)
 
-        # Dataloaders
-        train_loader = build_dataloader(
-            mols_train_dset,
-            num_workers=self.num_workers,
-            shuffle=False
+        # Assign to new dataset
+        mols_train_dset = IC50_Dataset(
+            mols_train_dset, 
+            train_descs, 
+            mols_train_dset.targets
         )
-        val_loader = data.build_dataloader(
-            mols_val_dset,
+
+        mols_val_dset = IC50_Dataset(
+            mols_val_dset, 
+            val_descs, 
+            mols_val_dset.targets
+        )
+
+        mols_test_dset = IC50_Dataset(
+            mols_test_dset, 
+            test_descs, 
+            mols_test_dset.targets
+        )
+
+        # Dataloaders
+        train_loader = DataLoader(
+            mols_train_dset, 
+            batch_size=32,
+            num_workers=self.num_workers, 
+            shuffle=True
+        )
+        val_loader = DataLoader(
+            mols_val_dset, 
+            batch_size=32,
             num_workers=self.num_workers, 
             shuffle=False
         )
-        test_loader = data.build_dataloader(
-            mols_test_dset,
+        test_loader = DataLoader(
+            mols_test_dset, 
+            batch_size=32,
             num_workers=self.num_workers, 
             shuffle=False
         )

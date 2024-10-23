@@ -1,6 +1,7 @@
 ## Imports
 # Standard library imports
 import os
+from tqdm import tqdm
 import nest_asyncio
 nest_asyncio.apply()
 
@@ -9,18 +10,22 @@ import sqlite3
 import numpy as np
 import pandas as pd
 import torch
-from torch.nn import DataParallel
+from torch import nn
 import lmdeploy
 from lmdeploy import GenerationConfig
+from transformers import pipeline as transformers_pipeline
+from transformers import AutoTokenizer, LlamaForQuestionAnswering, AutoModelForCausalLM
 from rdkit import Chem
 from rdkit.Chem import Descriptors, Scaffolds
+from rdkit.Chem.Scaffolds import MurckoScaffold
 
 # Local imports
 
 # GPU
-os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2'
 print('CUDA available: ', torch.cuda.is_available())
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+DEVICE_COUNT = torch.cuda.device_count()
+print('Device Count: ', DEVICE_COUNT)  # Number of visible GPUs
 
 ## Constants
 # Directory
@@ -28,7 +33,8 @@ CUR_DIR = os.path.dirname(os.path.realpath('__file__'))
 
 # Chembl data
 CYP3A4_CHEMBL_ID = 'CHEMBL340'
-CHEMBL_DB_PATH = '/data/rbg/users/vincentf/data_uncertainty/chembl_34/chembl_34/chembl_34_sqlite/chembl_34.db'
+CHEMBL_DB_PATH = '/data/rbg/users/vincentf/data_uncertainty/chembl_34/' + \
+    'chembl_34/chembl_34_sqlite/chembl_34.db'
 JSON_PATH = f'{CUR_DIR}/data/chembl_data.json'
 
 # Model
@@ -115,7 +121,10 @@ def fix_chembl_data():
     chembl_df = df[
         (df['doi'].notnull())
     ].reset_index(drop=True)
-    print(f'\nNumber of entries with a document attached: {len(chembl_df)} / {len(df)}')
+    print(
+        'Number of entries with a document attached:', 
+        len(chembl_df) / len(df)
+    )
 
     # Journal information (suggesting similar criteria for acceptance)
     journals = chembl_df['journal'].dropna().unique()
@@ -199,8 +208,11 @@ def fix_chembl_data():
     chembl_df = chembl_df.reindex(columns=cols)
 
     # Save data for regression task
-    chembl_df.to_csv(f'{CUR_DIR}/data/regression.csv')
-    chembl_df.to_json(f'{CUR_DIR}/data/regression.json', orient='records')
+    chembl_df.to_csv(f'{CUR_DIR}/data/chembl_regression.csv')
+    chembl_df.to_json(
+        f'{CUR_DIR}/data/chembl_regression.json', 
+        orient='records'
+    )
     print(chembl_df.info())
     print(chembl_df.head())
 
@@ -217,58 +229,198 @@ def fix_chembl_data():
     print('Number of unique dois: ', len(chembl_df['doi'].unique()))
 
 def get_doi_text():
-    pipe = DataParallel(lmdeploy.pipeline(
-        MODEL_NAME, 
-        gen_config=GenerationConfig(
-            max_new_tokens=1024,
-            top_p=0.8,
-            top_k=5,
-            temperature=0.8
-        )
-    )).to(DEVICE)
+    qa_model = LlamaForQuestionAnswering.from_pretrained(MODEL_NAME)
+    sum_model = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    
+    if DEVICE_COUNT > 1:
+        qa_model = nn.DataParallel(qa_model)
+        sum_model = nn.DataParallel(sum_model)
+
+    qa_pipe = transformers_pipeline(
+        'question-answering', 
+        model=qa_model.module if isinstance(
+            qa_model, 
+            nn.DataParallel
+        ) else qa_model,
+        tokenizer=tokenizer,
+        device=[0,1,2,3]
+    )
+
+    summarization_pipe = transformers_pipeline(
+        'summarization', 
+        model=sum_model.module if isinstance(
+            sum_model, 
+            nn.DataParallel
+        ) else sum_model,
+        tokenizer=tokenizer,
+        device=[4,5,6,7]
+    )
+    # pipe = lmdeploy.pipeline(
+    #     MODEL_NAME, 
+    #     gen_config=GenerationConfig(
+    #         max_new_tokens=4096,
+    #         top_p=0.8,
+    #         top_k=5,
+    #         temperature=0.5
+    #     )
+    # )
 
     # Load data
-    df = pd.read_json(f'{CUR_DIR}/data/regression.json')
+    df = pd.read_json(f'{CUR_DIR}/data/chembl_regression.json')
     print(df.head())
-    
+
+    num_llm_entries = 0
     df['text_summary'] = None
     for i, row in df.iterrows():
+        compound = row['smiles']
         value = row['value']
         doi = row['doi']
         print('Value: ', value)
         print('DOI: ', doi)
 
+        # Check if text has already been processed
+        if df.iloc[i]['text_summary']:
+            continue
+
         # Load text
         try:
-            txt_path = '/data/rbg/users/vincentf/data_uncertainty/c340_txt/'
-            txt_path += f'{doi.replace("/", "_")}.txt'
+            txt_dir = '/data/rbg/users/vincentf/data_uncertainty/c340_txt/'
+            txt_file = f'{doi.replace("/", "_")}.txt'
+            txt_path = txt_dir + txt_file
             with open(txt_path, 'r', encoding='utf-8') as file:
                 text = file.read()
         except:
             print('No text available for DOI: ', doi, '\n')
             continue
 
-        response = pipe([
-            f'''   
-            For the following text:
-            {text}
-            
-            Given the Cytochrome P450 (CYP) 3A4 IC50 measurement that produced the result:
-            {value} uM (might be mentioned in different units).
+        def tokenize_text(text):
+            tokens = tokenizer.encode(text, return_tensors='pt')
+            return tokens
         
-            I am looking for only the following information:
-            1. The experimental conditions of the assay (e.g., substrate concentration, probe type, incubation time, buffer conditions).
-            2. The method used to determine the IC50 value (e.g., type of assay, detection method).
-            3. Any other relevant details about how the IC50 was measured.
-            '''
-        ])
-        print(response.text[0])
-        df.iloc[i, df.columns.get_loc('text_summary')] = response.text[0]
-        break
+        def chunk_tokens(tokens, chunk_size=3872):
+            return [tokens[:, i:i + chunk_size] for i in range(
+                0, 
+                tokens.size(1), 
+                chunk_size // 2 # So that no important information is split
+            )]
+        
+        responses = []
+        chunks = chunk_tokens(tokenize_text(text))
+        for chunk in tqdm(chunks, desc='Processing text chunks'):
+            decoded_chunk = tokenizer.decode(chunk[0], skip_special_tokens=True)
+            questions = [
+                'What are the experimental conditions of the assay (e.g.,' + \
+                    'substrate concentration, probe type, incubation time,' + \
+                    'buffer conditions)?',
+                'What method was used to determine the IC50 value (e.g.,' + \
+                    'type of assay, detection method)?',
+                'What other relevant details are there about how the IC50' + \
+                    'was measured?'
+            ]
+            context = f'''
+                Given the CYP3A4 (Cytochrome P450 3A4) IC50 measurement that
+                produced the following result: {value} uM (might be in
+                different units) for the following compound: {compound}.
+
+                Find the information in this text: {decoded_chunk}.
+                Use the exact wording from the text to answer the questions.
+
+                If no text is present related to the requested information,
+                please return "No information found" only once, no other
+                information.
+            '''    
+
+            for question in questions:
+                response = qa_pipe(
+                    context=context, 
+                    question=question, 
+                    max_length=100, 
+                    min_length=25, 
+                    do_sample=False
+                )
+                responses.append(str(response['answer'].replace('\n', ' ')))   
+
+            print(responses)
+            
+            summary = summarization_pipe(
+                ' '.join([r['answer'] for r in responses]),
+                max_length=100,
+                min_length=25,
+                do_sample=False
+            )
+
+            print(summary)
+            break
+        
+        break     
+
+            # prompt = f'''               
+            #     Given the CYP3A4 (Cytochrome P450 3A4) IC50 measurement that 
+            #     produced the following result: {value} uM (might be in 
+            #     different units) for the following compound: {compound}.
+
+            #     I am looking for only the following information:
+            #     1.  The experimental conditions of the assay (e.g., substrate 
+            #         concentration, probe type, incubation time, buffer 
+            #         conditions).
+            #     2.  The method used to determine the IC50 value (e.g., type of 
+            #         assay, detection method).
+            #     3.  Any other relevant details about how the IC50 was measured.
+
+            #     Find the information in this text: {decoded_chunk}.
+            #     Use the exact wording from the text to answer the questions.
+
+            #     If no text is present related to the requested information, 
+            #     please return "No information found" only once, no other 
+            #     information.
+            # '''
+            
+
+            # response = pipe([prompt])
+            # responses.append(response[0].text)
+
+        # prompt = f'''
+        #     Given the CYP3A4 (Cytochrome P450 3A4) IC50 measurement that 
+        #     produced the following result: {value} uM (might be in 
+        #     different units).     
+
+        #     Please condense the following text down to one statement regarding
+        #     the following:
+        #     1.  The experimental conditions of the assay (e.g., substrate 
+        #             concentration, probe type, incubation time, buffer 
+        #             conditions).
+        #     2.  The method used to determine the IC50 value (e.g., type of 
+        #         assay, detection method).
+        #     3.  Any other relevant details about how the IC50 was measured.
+
+        #     Here is the text: {' '.join(responses)}.
+
+        #     Output only the response and not an introduction or conclusion.
+        #     Remember, the response should only be in relation to the IC50
+        #     measurement for CYP3A4 (Cytochrome P450 3A4).
+        # '''
+        # response = pipe([prompt])
+        # df.iloc[
+        #     i, 
+        #     df.columns.get_loc('text_summary')
+        # ] = str(response[0].text).replace('\n', ' ')
+
+        # num_llm_entries += 1
+        # if num_llm_entries % 10 == 0:
+        #     print(f'Number of entries processed: {num_llm_entries}')
+
+        #     # Save data
+        #     df.to_csv(f'{CUR_DIR}/data/regression_with_texts.csv')
+        #     df.to_json(
+        #         f'{CUR_DIR}/data/regression_with_texts.json', 
+        #         orient='records'
+        #     )
 
     # Save data
-    df.to_csv(f'{CUR_DIR}/data/regression.csv')
-    df.to_json(f'{CUR_DIR}/data/regression.json', orient='records')
+    df.to_csv(f'{CUR_DIR}/data/regression_with_texts.csv')
+    df.to_json(f'{CUR_DIR}/data/regression_with_texts.json', orient='records')
+
 
 if __name__ == '__main__':
     # pull_chembl_data()

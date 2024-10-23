@@ -1,0 +1,276 @@
+## Imports
+# Standard library imports
+import os
+import nest_asyncio
+nest_asyncio.apply()
+
+# Third-party imports
+import sqlite3
+import numpy as np
+import pandas as pd
+import torch
+from torch.nn import DataParallel
+import lmdeploy
+from lmdeploy import GenerationConfig
+from rdkit import Chem
+from rdkit.Chem import Descriptors, Scaffolds
+
+# Local imports
+
+# GPU
+os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2'
+print('CUDA available: ', torch.cuda.is_available())
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+## Constants
+# Directory
+CUR_DIR = os.path.dirname(os.path.realpath('__file__'))
+
+# Chembl data
+CYP3A4_CHEMBL_ID = 'CHEMBL340'
+CHEMBL_DB_PATH = '/data/rbg/users/vincentf/data_uncertainty/chembl_34/chembl_34/chembl_34_sqlite/chembl_34.db'
+JSON_PATH = f'{CUR_DIR}/data/chembl_data.json'
+
+# Model
+MODEL_NAME = 'meta-llama/Meta-Llama-3.1-8B-Instruct'
+
+
+def pull_chembl_data():
+    # Connect to chembl databse
+    conn = sqlite3.connect(CHEMBL_DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+
+    # Value types to extract
+    value_types = [
+        'IC50', 'IC5', 'Log IC50', 'pIC50', 'log(1/IC50)', '-Log IC50(M)', 
+        'Ratio IC50', 'IC50(app)'
+    ]
+    placeholders = ','.join(['?'] * len(value_types))
+
+    # Query
+    query = f'''
+        SELECT 
+            targets.pref_name AS target,
+            targets.chembl_id AS target_id,
+            assays.chembl_id AS assay_id, 
+            compound_structures.canonical_smiles AS smiles,
+            activities.standard_type AS type,
+            activities.standard_relation AS relation,
+            activities.standard_value AS value,
+            activities.standard_units AS unit,
+            activities.molregno AS molregno,
+            assays.doc_id AS doc_id,
+            docs.journal AS journal,
+            docs.doi AS doi,
+            assays.description AS description,
+            assays.assay_type AS assay_type, 
+            assays.assay_test_type AS assay_test_type, 
+            assays.assay_organism AS assay_organism, 
+            assays.assay_tissue AS assay_tissue, 
+            assays.assay_cell_type AS assay_cell_type, 
+            assays.confidence_score AS assay_confidence_score, 
+            activities.data_validity_comment AS data_validity_comment
+        FROM 
+            activities
+        JOIN 
+            target_dictionary AS targets ON assays.tid = targets.tid
+        JOIN 
+            assays ON activities.assay_id = assays.assay_id
+        JOIN
+            compound_structures USING (molregno)
+        JOIN 
+            docs ON assays.doc_id = docs.doc_id
+        WHERE 
+            targets.chembl_id = ?
+            AND targets.target_type = 'SINGLE PROTEIN'
+            AND activities.standard_type IN ({placeholders})
+            AND activities.standard_value != 0
+            AND activities.standard_value IS NOT NULL
+        ORDER BY 
+            activities.assay_id, value DESC
+    '''
+
+    # Execute query
+    cur.execute(query, (CYP3A4_CHEMBL_ID, *value_types))
+
+    # Fetch rows from the database
+    rows = cur.fetchall()
+
+    # Save as dataframe
+    data = [dict(row) for row in rows]
+    df = pd.DataFrame(data)
+    df.to_json(f'{CUR_DIR}/data/chembl_data.json', orient='records')
+
+    # Example
+    for key, value in dict(rows[0]).items():
+        print(key, ': ', value)
+
+def fix_chembl_data():
+    # Load into dataframe
+    df = pd.read_json(JSON_PATH)
+    print(df.head())
+
+    # Investigate number of entries with a document listed
+    chembl_df = df[
+        (df['doi'].notnull())
+    ].reset_index(drop=True)
+    print(f'\nNumber of entries with a document attached: {len(chembl_df)} / {len(df)}')
+
+    # Journal information (suggesting similar criteria for acceptance)
+    journals = chembl_df['journal'].dropna().unique()
+    print(f'\nNumber of journals within supporting documents: {len(journals)}')
+    print(f'Journal names: {journals}')
+
+    # Get the molecular weight from a smiles string
+    def calculate_mol_weight(smiles):
+        mol = Chem.MolFromSmiles(smiles)
+        return Descriptors.ExactMolWt(mol)
+
+    # Known unit conversion factors
+    unit_dict = {'uM': 1, 'mM': 1e3, 'nM': 1e-3}
+
+    # Function to get unit conversion factor
+    def get_conversion_factor(unit, mol_weight=None):
+        if unit == 'ug ml-1':
+            return 1e3 / mol_weight
+        elif unit == 'mg/ml':
+            return 1e6 / mol_weight
+        else:
+            return unit_dict.get(unit)
+
+    # Function to convert units
+    def convert_units(row):
+        smiles, value, unit = row['smiles'], row['value'], row['unit']
+        mol_weight = calculate_mol_weight(smiles)
+        conversion_factor = get_conversion_factor(unit, mol_weight)
+        if conversion_factor:
+            row['value'] = value * conversion_factor
+            row['unit'] = 'uM'
+        
+        return row
+
+    # Allowed unit types
+    allowed_units = ['uM', 'nM']
+    invalid_dois = [
+        '10.1016/j.ejmech.2007.10.034', '10.1016/j.bmcl.2012.08.044', 
+        '10.1021/acsmedchemlett.8b00220', '10.1016/j.ejmech.2008.12.004',
+        '10.1016/j.bmcl.2015.01.005'
+    ]
+
+    # Correct discovered incorrect unit type for doi
+    chembl_df.loc[chembl_df['doi'] == '10.1021/jm049696n', 'unit'] = 'nM'
+    chembl_df.loc[chembl_df['doi'] == '10.1021/jm900521k', 'value'] /= 1e6
+    chembl_df.loc[chembl_df['doi'] == '10.1021/jm900521k', 'unit'] = 'uM'
+
+    # Convert ic50 value to correct units
+    chembl_df = chembl_df.apply(convert_units, axis=1)
+
+    # Remove rows with data not of interest
+    chembl_df = chembl_df[
+        (chembl_df['type'] == 'IC50') &
+        (chembl_df['value'].notna()) &
+        (chembl_df['value'] != 0) &
+        (chembl_df['unit'].notna()) &
+        (chembl_df['unit'].isin(allowed_units)) &
+        (chembl_df['relation'].notna()) &
+        (chembl_df['relation'] == '=') &
+        ~(chembl_df['doi'].isin(invalid_dois)) &
+        (chembl_df['description'].notna())
+    ].sort_values(by='value', ascending=False)
+
+    # Add log value column
+    chembl_df['log_value'] = chembl_df['value'].apply(np.log10)
+    cols = chembl_df.columns.insert(7, 'log_value')[:-1]
+    chembl_df = chembl_df.reindex(columns=cols)
+
+    print(f'Total number of activities for target: {len(chembl_df)}')
+
+    # Add scaffold smiles column
+    def get_scaffold(smiles):
+        mol = Chem.MolFromSmiles(smiles)
+        return Chem.MolToSmiles(
+            Scaffolds.MurckoScaffold.GetScaffoldForMol(mol)
+        )
+    chembl_df['scaffold_smiles'] = chembl_df['smiles'].apply(get_scaffold)
+
+    # Move column to after smiles
+    cols = chembl_df.columns.insert(4, 'scaffold_smiles')[:-1]
+    chembl_df = chembl_df.reindex(columns=cols)
+
+    # Save data for regression task
+    chembl_df.to_csv(f'{CUR_DIR}/data/regression.csv')
+    chembl_df.to_json(f'{CUR_DIR}/data/regression.json', orient='records')
+    print(chembl_df.info())
+    print(chembl_df.head())
+
+    print('Unique targets: ', chembl_df['target'].unique())
+    print('Unique target ids: ', chembl_df['target_id'].unique())
+    print('Unique types: ', chembl_df['type'].unique())
+    print('Length of data: ', len(chembl_df))
+    print('Number of unique smiles: ', len(chembl_df['smiles'].unique()))
+    print(
+        'Number of unique scaffolds: ', 
+        len(chembl_df['scaffold_smiles'].unique())
+    )
+    print('Number of unique values: ', len(chembl_df['value'].unique()))
+    print('Number of unique dois: ', len(chembl_df['doi'].unique()))
+
+def get_doi_text():
+    pipe = DataParallel(lmdeploy.pipeline(
+        MODEL_NAME, 
+        gen_config=GenerationConfig(
+            max_new_tokens=1024,
+            top_p=0.8,
+            top_k=5,
+            temperature=0.8
+        )
+    )).to(DEVICE)
+
+    # Load data
+    df = pd.read_json(f'{CUR_DIR}/data/regression.json')
+    print(df.head())
+    
+    df['text_summary'] = None
+    for i, row in df.iterrows():
+        value = row['value']
+        doi = row['doi']
+        print('Value: ', value)
+        print('DOI: ', doi)
+
+        # Load text
+        try:
+            txt_path = '/data/rbg/users/vincentf/data_uncertainty/c340_txt/'
+            txt_path += f'{doi.replace("/", "_")}.txt'
+            with open(txt_path, 'r', encoding='utf-8') as file:
+                text = file.read()
+        except:
+            print('No text available for DOI: ', doi, '\n')
+            continue
+
+        response = pipe([
+            f'''   
+            For the following text:
+            {text}
+            
+            Given the Cytochrome P450 (CYP) 3A4 IC50 measurement that produced the result:
+            {value} uM (might be mentioned in different units).
+        
+            I am looking for only the following information:
+            1. The experimental conditions of the assay (e.g., substrate concentration, probe type, incubation time, buffer conditions).
+            2. The method used to determine the IC50 value (e.g., type of assay, detection method).
+            3. Any other relevant details about how the IC50 was measured.
+            '''
+        ])
+        print(response.text[0])
+        df.iloc[i, df.columns.get_loc('text_summary')] = response.text[0]
+        break
+
+    # Save data
+    df.to_csv(f'{CUR_DIR}/data/regression.csv')
+    df.to_json(f'{CUR_DIR}/data/regression.json', orient='records')
+
+if __name__ == '__main__':
+    # pull_chembl_data()
+    # fix_chembl_data()
+    get_doi_text()

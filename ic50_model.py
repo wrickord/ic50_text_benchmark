@@ -9,6 +9,8 @@ import pandas as pd
 from lightning import pytorch as pl
 import torch
 from torch.utils.data import DataLoader
+from transformers import AutoTokenizer
+from rdkit import Chem
 from chemprop import data, featurizers, nn
 
 # Local imports
@@ -16,20 +18,20 @@ from chemprop_custom.mpnn import MPNN
 from chemprop_custom.data import build_dataloader
 
 # CUDA
-print(f"CUDA available: {torch.cuda.is_available()}")
+print(f'CUDA available: {torch.cuda.is_available()}')
 
 
 class IC50_Dataset(torch.utils.data.Dataset):
-    def __init__(self, feature1, feature2, labels):
-        self.feature1 = feature1
-        self.feature2 = feature2
+    def __init__(self, mols, texts, labels):
+        self.mols = mols
+        self.texts = texts
         self.labels = labels
 
     def __len__(self):
         return len(self.labels)
 
     def __getitem__(self, idx):
-        return (self.feature1[idx], self.feature2[idx]), self.labels[idx]
+        return (self.mols[idx], self.texts[idx]), self.labels[idx]
     
 
 class IC50_Model():
@@ -39,7 +41,7 @@ class IC50_Model():
                  num_workers, 
                  smiles_column, 
                  scaffold_smiles_column,
-                 description_column,
+                 text_column,
                  target_columns,
                  text_encoder_model_name,
                  verbose=False):
@@ -48,7 +50,7 @@ class IC50_Model():
         self.num_workers = num_workers
         self.smiles_column = smiles_column
         self.scaffold_smiles_column = scaffold_smiles_column
-        self.description_column = description_column
+        self.text_column = text_column
         self.target_columns = target_columns
         self.text_encoder_model_name = text_encoder_model_name
         self.verbose = verbose
@@ -61,14 +63,21 @@ class IC50_Model():
 
         return results
     
+    def inspect_data(X):
+        print('Type:', X.type())
+        print('Shape:', X.shape)
+        print('Requires Grad:', X.requires_grad)
+        print('Numerical Range: [{:.2f}, {:.2f}]'.format(X.min(), X.max()))
+        print('Mean and Var: {:.2f}, {:.2f}'.format(X.mean(), X.var()))
+    
     def inspect_dataloader(self, dataloader):
-        print(f"Number of workers: {dataloader.num_workers}")
-        print(f"Batch size: {dataloader.batch_size}")
-        print(f"Pin memory: {dataloader.pin_memory}")
+        print(f'Number of workers: {dataloader.num_workers}')
+        print(f'Batch size: {dataloader.batch_size}')
+        print(f'Pin memory: {dataloader.pin_memory}')
         
         dataset = dataloader.dataset
-        print(f"Dataset length: {len(dataset)}")
-        print(f"Dataset type: {type(dataset)}")
+        print(f'Dataset length: {len(dataset)}')
+        print(f'Dataset type: {type(dataset)}')
 
     def make_scaffold_split(self, mols, split_ratio=(0.8, 0.1, 0.1)):
         assert len(split_ratio) == 3, 'Split ratio must have 3 values'
@@ -90,7 +99,6 @@ class IC50_Model():
         num_molecules = len(mols)
         num_test = int(np.floor(split_ratio[2] * num_molecules))
         num_val = int(np.floor(split_ratio[1] * num_molecules))
-        num_train = num_molecules - num_test - num_val
 
         # Step 4: Assign scaffolds to sets, adding larger scaffolds to training
         train_indices, test_indices, val_indices = [], [], []
@@ -154,6 +162,47 @@ class IC50_Model():
         
         return list1, list2, list3
 
+    def extract_mol_features(self, mol):
+        features = Chem.AllChem.GetMorganFingerprintAsBitVect(
+            mol, 
+            2, 
+            nBits=2048
+        )
+        return torch.tensor(features, dtype=torch.float32)
+
+    def tokenize_text(self, text):
+        tokenizer = AutoTokenizer.from_pretrained(self.text_encoder_model_name)
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenized = tokenizer(
+            text, 
+            padding='max_length', 
+            truncation=True, 
+            max_length=2048
+        )
+        return torch.tensor(tokenized['input_ids'], dtype=torch.long)
+
+    def custom_collate_fn(self, batch):
+        mol_features = []
+        text_features = []
+        
+        for item in batch:
+            mol, text = item[0][0], item[0][1]
+            
+            # Process Mol object
+            mol_features.append(self.extract_mol_features(mol))
+            
+            # Process text
+            text_features.append(self.tokenize_text(text))
+        
+        # Stack mol features and pad text features if necessary
+        mol_batch = torch.stack(mol_features)
+        text_batch = torch.nn.utils.rnn.pad_sequence(
+            text_features, 
+            batch_first=True
+        )  # Padding for variable-length sequences
+        
+        return mol_batch, text_batch
+
     def split_data(self, split_sizes=(0.8, 0.1, 0.1)):
         # Load data
         df_input = pd.read_csv(self.input_path, index_col=0)
@@ -161,9 +210,11 @@ class IC50_Model():
 
         # Organize data for modeling
         smis = df_input.loc[:, self.smiles_column].values
-        descs = df_input.loc[:, self.description_column].values
+        texts = df_input.loc[:, self.text_column].values
         ys = df_input.loc[:, self.target_columns].values
-        all_data = [data.MoleculeDatapoint.from_smi(smi, y) for smi, y in zip(smis, ys)]
+        all_data = [
+            data.MoleculeDatapoint.from_smi(smi, y) for smi, y in zip(smis, ys)
+        ]
         mols = [d.mol for d in all_data]
 
         # Split data
@@ -173,58 +224,77 @@ class IC50_Model():
         train_mols, val_mols, test_mols = data.split_data_by_indices(
             all_data, train_indices, val_indices, test_indices
         )
-        train_descs = descs[train_indices]
-        val_descs = descs[val_indices]
-        test_descs = descs[test_indices]
+        train_texts = texts[train_indices]
+        val_texts = texts[val_indices]
+        test_texts = texts[test_indices]
 
         # Get train, val, and test datasets for molecules
         featurizer = featurizers.SimpleMoleculeMolGraphFeaturizer()
 
-        mols_train_dset = data.MoleculeDataset(train_mols, featurizer)
+        mols_train_dset = data.MoleculeDataset(
+            train_mols, 
+            train_texts,
+            featurizer
+        )
         self.scaler = mols_train_dset.normalize_targets()
-
-        mols_val_dset = data.MoleculeDataset(val_mols, featurizer)
+        
+        mols_val_dset = data.MoleculeDataset(
+            val_mols,
+            val_texts,
+            featurizer
+        )
         mols_val_dset.normalize_targets(self.scaler)
 
-        mols_test_dset = data.MoleculeDataset(test_mols, featurizer)
-
-        # Assign to new dataset
-        mols_train_dset = IC50_Dataset(
-            mols_train_dset, 
-            train_descs, 
-            mols_train_dset.targets
+        mols_test_dset = data.MoleculeDataset(
+            test_mols,
+            test_texts,
+            featurizer
         )
 
-        mols_val_dset = IC50_Dataset(
-            mols_val_dset, 
-            val_descs, 
-            mols_val_dset.targets
-        )
+        train_loader = build_dataloader(mols_train_dset)
+        val_loader = build_dataloader(mols_val_dset)
+        test_loader = build_dataloader(mols_test_dset)
 
-        mols_test_dset = IC50_Dataset(
-            mols_test_dset, 
-            test_descs, 
-            mols_test_dset.targets
-        )
+        # # Assign to new dataset
+        # mols_train_dset = IC50_Dataset(
+        #     mols_train_dset.mols, 
+        #     train_texts, 
+        #     mols_train_dset.Y
+        # )
+
+        # mols_val_dset = IC50_Dataset(
+        #     mols_val_dset.mols, 
+        #     val_texts, 
+        #     mols_val_dset.Y
+        # )
+
+        # mols_test_dset = IC50_Dataset(
+        #     mols_test_dset.mols, 
+        #     test_texts, 
+        #     mols_test_dset.Y
+        # )
 
         # Dataloaders
         train_loader = DataLoader(
             mols_train_dset, 
             batch_size=32,
             num_workers=self.num_workers, 
-            shuffle=True
+            shuffle=True,
+            collate_fn=self.custom_collate_fn
         )
         val_loader = DataLoader(
             mols_val_dset, 
             batch_size=32,
             num_workers=self.num_workers, 
-            shuffle=False
+            shuffle=False,
+            collate_fn=self.custom_collate_fn
         )
         test_loader = DataLoader(
             mols_test_dset, 
             batch_size=32,
             num_workers=self.num_workers, 
-            shuffle=False
+            shuffle=False,
+            collate_fn=self.custom_collate_fn
         )
 
         return train_loader, val_loader, test_loader
@@ -282,12 +352,12 @@ class IC50_Model():
 
 # Main function
 if __name__ == '__main__':
-    input_path = Path.cwd() / 'data' / 'regression.csv'
-    device_ids = [0] # Set GPU device
+    input_path = Path.cwd() / 'data' / 'chembl_regression.csv'
+    device_ids = [5] # Set GPU device
     num_workers = 8
     smiles_column = 'smiles'
     scaffold_smiles_column = 'scaffold_smiles'
-    description_column = 'description'
+    text_column = 'description'
     target_columns = ['log_value']
     text_encoder_model_name = 'meta-llama/Meta-Llama-3.1-8B-Instruct'
 
@@ -297,7 +367,7 @@ if __name__ == '__main__':
         num_workers, 
         smiles_column,
         scaffold_smiles_column,
-        description_column, 
+        text_column, 
         target_columns,
         text_encoder_model_name,
         verbose=True

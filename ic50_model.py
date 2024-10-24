@@ -1,4 +1,5 @@
 # Standard library imports
+import os
 import random
 from pathlib import Path
 from collections import defaultdict
@@ -12,27 +13,16 @@ from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 from rdkit import Chem
 from chemprop import data, featurizers, nn
+from chemprop.models import MPNN
 
 # Local imports
-from chemprop_custom.mpnn import MPNN
-from chemprop_custom.data import build_dataloader
 
 # CUDA
 print(f'CUDA available: {torch.cuda.is_available()}')
 
+# Consants
+CUR_DIR = os.path.dirname(os.path.realpath('__file__'))
 
-class IC50_Dataset(torch.utils.data.Dataset):
-    def __init__(self, mols, texts, labels):
-        self.mols = mols
-        self.texts = texts
-        self.labels = labels
-
-    def __len__(self):
-        return len(self.labels)
-
-    def __getitem__(self, idx):
-        return (self.mols[idx], self.texts[idx]), self.labels[idx]
-    
 
 class IC50_Model():
     def __init__(self, 
@@ -161,141 +151,122 @@ class IC50_Model():
                 list1.append(id_)
         
         return list1, list2, list3
-
-    def extract_mol_features(self, mol):
-        features = Chem.AllChem.GetMorganFingerprintAsBitVect(
-            mol, 
-            2, 
-            nBits=2048
+    
+    def write_split(self, df, indices, type, index=None):
+        pd.DataFrame({
+            'indices': indices,
+            'smiles': df.loc[indices, self.smiles_column].values,
+            'scaffold_smiles': df.loc[
+                indices, 
+                self.scaffold_smiles_column
+            ].values,
+            'log_value': df.loc[indices, 'log_value'].values
+        }).sort_values('indices').to_csv(
+            f'{CUR_DIR}/data/splits/{type}_split.csv' if index is None else
+            f'{CUR_DIR}/data/splits/{type}_split_{index}.csv',
+            index=False
         )
-        return torch.tensor(features, dtype=torch.float32)
 
-    def tokenize_text(self, text):
-        tokenizer = AutoTokenizer.from_pretrained(self.text_encoder_model_name)
-        tokenizer.pad_token = tokenizer.eos_token
-        tokenized = tokenizer(
-            text, 
-            padding='max_length', 
-            truncation=True, 
-            max_length=2048
-        )
-        return torch.tensor(tokenized['input_ids'], dtype=torch.long)
-
-    def custom_collate_fn(self, batch):
-        mol_features = []
-        text_features = []
-        
-        for item in batch:
-            mol, text = item[0][0], item[0][1]
-            
-            # Process Mol object
-            mol_features.append(self.extract_mol_features(mol))
-            
-            # Process text
-            text_features.append(self.tokenize_text(text))
-        
-        # Stack mol features and pad text features if necessary
-        mol_batch = torch.stack(mol_features)
-        text_batch = torch.nn.utils.rnn.pad_sequence(
-            text_features, 
-            batch_first=True
-        )  # Padding for variable-length sequences
-        
-        return mol_batch, text_batch
-
-    def split_data(self, split_sizes=(0.8, 0.1, 0.1)):
+    def split_data(self, split_sizes=(0.8, 0.1, 0.1), split_idx=1):
         # Load data
-        df_input = pd.read_csv(self.input_path, index_col=0)
-        print(df_input.head()) if self.verbose else None
-
-        # Organize data for modeling
+        df_input = pd.read_csv(self.input_path)
         smis = df_input.loc[:, self.smiles_column].values
-        texts = df_input.loc[:, self.text_column].values
         ys = df_input.loc[:, self.target_columns].values
         all_data = [
             data.MoleculeDatapoint.from_smi(smi, y) for smi, y in zip(smis, ys)
         ]
         mols = [d.mol for d in all_data]
 
-        # Split data
-        train_indices, val_indices, test_indices = self.make_scaffold_split(
-            mols, split_sizes
-        )
+        if split_idx == 0:
+            # Split data
+            train_indices, val_indices, test_indices = self.make_scaffold_split(
+                mols, split_sizes
+            )
+            self.write_split(df_input, train_indices, 'train')
+            self.write_split(df_input, val_indices, 'val')
+            self.write_split(df_input, test_indices, 'test')
+        else:
+            # Load split info from CSV
+            train_indices = pd.read_csv(
+                f'{CUR_DIR}/data/splits/train_split_{split_idx}.csv'
+            )['train_indices'].values
+            train_indices = np.random.permutation(train_indices)
+            val_indices = pd.read_csv(
+                f'{CUR_DIR}/data/splits/val_split_{split_idx}.csv'
+            )['val_indices'].values
+            val_indices = np.random.permutation(val_indices)
+            test_indices = pd.read_csv(
+                f'{CUR_DIR}/data/splits/test_split_{split_idx}.csv'
+            )['test_indices'].values
+            test_indices = np.random.permutation(test_indices)
+        
         train_mols, val_mols, test_mols = data.split_data_by_indices(
             all_data, train_indices, val_indices, test_indices
         )
-        train_texts = texts[train_indices]
-        val_texts = texts[val_indices]
-        test_texts = texts[test_indices]
+
+        if self.text_column is not None:
+            texts = df_input.loc[:, self.text_column].values 
+            train_texts = list(texts[train_indices])
+            val_texts = list(texts[val_indices])
+            test_texts = list(texts[test_indices])
+
+            # # Tokenize text
+            # tokenizer = AutoTokenizer.from_pretrained(
+            #     self.text_encoder_model_name
+            # )
+            # tokenizer.pad_token = tokenizer.eos_token
+
+            # train_texts = [
+            #     tokenizer(
+            #         train_text, 
+            #         padding=True
+            #     ).input_ids for train_text in train_texts
+            # ]
+            # val_texts = [
+            #     tokenizer(
+            #         val_text, 
+            #         padding=True
+            #     ).input_ids for val_text in val_texts
+            # ]
+            # test_texts = [
+            #     tokenizer(
+            #         test_text, 
+            #         padding=True
+            #     ).input_ids for test_text in test_texts
+            # ]
 
         # Get train, val, and test datasets for molecules
         featurizer = featurizers.SimpleMoleculeMolGraphFeaturizer()
 
         mols_train_dset = data.MoleculeDataset(
             train_mols, 
-            train_texts,
-            featurizer
+            featurizer,
+            train_texts if self.text_column is not None else None
         )
         self.scaler = mols_train_dset.normalize_targets()
         
         mols_val_dset = data.MoleculeDataset(
             val_mols,
-            val_texts,
-            featurizer
+            featurizer,
+            val_texts if self.text_column is not None else None
         )
         mols_val_dset.normalize_targets(self.scaler)
 
         mols_test_dset = data.MoleculeDataset(
             test_mols,
-            test_texts,
-            featurizer
+            featurizer,
+            test_texts if self.text_column is not None else None
         )
 
-        train_loader = build_dataloader(mols_train_dset)
-        val_loader = build_dataloader(mols_val_dset)
-        test_loader = build_dataloader(mols_test_dset)
+        # Inspect mols_train_dset
+        print('Mols Train Dataset')
+        print('Number of datapoints:', len(mols_train_dset))
+        print(mols_train_dset[0])
+        breakpoint()
 
-        # # Assign to new dataset
-        # mols_train_dset = IC50_Dataset(
-        #     mols_train_dset.mols, 
-        #     train_texts, 
-        #     mols_train_dset.Y
-        # )
-
-        # mols_val_dset = IC50_Dataset(
-        #     mols_val_dset.mols, 
-        #     val_texts, 
-        #     mols_val_dset.Y
-        # )
-
-        # mols_test_dset = IC50_Dataset(
-        #     mols_test_dset.mols, 
-        #     test_texts, 
-        #     mols_test_dset.Y
-        # )
-
-        # Dataloaders
-        train_loader = DataLoader(
-            mols_train_dset, 
-            batch_size=32,
-            num_workers=self.num_workers, 
-            shuffle=True,
-            collate_fn=self.custom_collate_fn
-        )
-        val_loader = DataLoader(
-            mols_val_dset, 
-            batch_size=32,
-            num_workers=self.num_workers, 
-            shuffle=False,
-            collate_fn=self.custom_collate_fn
-        )
-        test_loader = DataLoader(
-            mols_test_dset, 
-            batch_size=32,
-            num_workers=self.num_workers, 
-            shuffle=False,
-            collate_fn=self.custom_collate_fn
-        )
+        train_loader = data.build_dataloader(mols_train_dset, shuffle=False)
+        val_loader = data.build_dataloader(mols_val_dset, shuffle=False)
+        test_loader = data.build_dataloader(mols_test_dset, shuffle=False)
 
         return train_loader, val_loader, test_loader
     
